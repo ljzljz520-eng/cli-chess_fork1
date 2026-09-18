@@ -1,12 +1,11 @@
 from cli_chess.core.game import GameModelBase
+from cli_chess.core.api.stream_manager import ConnectionState, PERMANENT_FAILURE_STATES
+from cli_chess.core.api.stream_manager import ReconnectingStream, open_stream_response
 from cli_chess.menus.tv_channel_menu import TVChannelMenuOptions
 from cli_chess.utils.event import Event, EventTopics
 from cli_chess.utils.logging import log
 from chess import COLOR_NAMES, COLORS, Color, WHITE
-from berserk.exceptions import ResponseError
-from time import sleep
 from typing import Optional, Dict
-import threading
 
 
 class WatchTVModel(GameModelBase):
@@ -15,15 +14,31 @@ class WatchTVModel(GameModelBase):
         self.channel = channel
         self._tv_stream = StreamTVChannel(self.channel)
         self._tv_stream.e_tv_stream_event.add_listener(self.stream_event_received)
+        self._tv_stream.e_stream_state_changed.add_listener(self._handle_stream_state)
 
     def start_watching(self):
         """Notify the TV stream thread to start"""
         self._tv_stream.start()
 
     def stop_watching(self):
-        """Stop the TV stream thread"""
-        if self._tv_stream.is_alive():
-            self._tv_stream.stop_watching()
+        """Stop the TV stream thread (bounded, interruptible)"""
+        self._tv_stream.stop_watching()
+
+    def _handle_stream_state(self, state: ConnectionState, *, message: str = "") -> None:
+        """Translates unified stream states into TV model update topics"""
+        if state is ConnectionState.CONNECTING:
+            self._notify_game_model_updated(EventTopics.GAME_SEARCH)
+        elif state is ConnectionState.RATE_LIMITED or (state is ConnectionState.RECOVERING and message):
+            # A message-less RECOVERING is the normal gap between two featured games
+            self._notify_game_model_updated(
+                EventTopics.ERROR,
+                msg=message or "Error streaming. Reconnecting..."
+            )
+        elif state in PERMANENT_FAILURE_STATES:
+            self._notify_game_model_updated(
+                EventTopics.ERROR,
+                msg=message or "Retries exhausted. Stopping TV."
+            )
 
     def _update_game_metadata(self, *args, data: Optional[Dict] = None) -> None:
         """Parses and saves the data of the game being played"""
@@ -84,78 +99,47 @@ class WatchTVModel(GameModelBase):
 
 
 # To restore old TV streaming logic see commit 23ca5cd
-class StreamTVChannel(threading.Thread):
+class StreamTVChannel(ReconnectingStream):
+    """Streams the featured games of a Lichess TV channel. Uses the unified
+       reconnect/backoff/cancel contract: waits are interruptible and the
+       blocking HTTP read is closed immediately on stop.
+    """
     def __init__(self, channel: TVChannelMenuOptions):
-        super().__init__(daemon=True)
+        super().__init__(name=f"lichess-tv-{channel.key}", eof_delay=2.0)
         self.channel = channel
-        self.max_retries = 10
-        self.retries = 0
-        self._stopped = threading.Event()
         self.e_tv_stream_event = Event()
 
         try:
             from cli_chess.core.api.api_manager import api_client
             self.api_client = api_client
         except Exception as e:
-            self.handle_exceptions(e)
+            log.error(f"Failed to import api_client for TV stream: {e}")
+            raise
 
-    def run(self):
-        """Main entrypoint for the thread"""
-        log.info(f"Started watching {self.channel.value} TV")
-        while not self._stopped.is_set():
-            try:
-                self.e_tv_stream_event.notify(EventTopics.GAME_SEARCH)
+    def _open_stream(self, generation: int):
+        # TODO: Update to use berserk TV specific method once implemented
+        return open_stream_response(
+            requestor=self.api_client.tv._r,  # noqa
+            path=f"/api/tv/{self.channel.key}/feed",
+        )
 
-                # TODO: Update to use berserk TV specific method once implemented
-                stream = self.api_client.tv._r.get(f"/api/tv/{self.channel.key}/feed", stream=True)  # noqa
+    def _handle_event(self, generation: int, event: dict) -> None:
+        t = event.get('t')
+        d = event.get('d')
+        if not t or not d:
+            raise ValueError(f"Unable to stream TV as the data is malformed: {event}")
 
-                for event in stream:
-                    if self._stopped.is_set():
-                        # TODO: This does close the stream, but not until the next event comes in (which can be a while
-                        #  sometimes (especially in longer time format games like Classical). Ideally there's
-                        #  a way to immediately kill the stream, without waiting for another event.
-                        break
+        if t == 'featured':
+            log.info(f"Started streaming TV game: {d.get('id')}")
+            self.e_tv_stream_event.notify(EventTopics.GAME_START, data=d)
 
-                    t = event.get('t')
-                    d = event.get('d')
-                    if not t or not d:
-                        raise ValueError(f"Unable to stream TV as the data is malformed: {event}")
+        if t == 'fen':
+            self.e_tv_stream_event.notify(EventTopics.MOVE_MADE, data=d)
 
-                    if t == 'featured':
-                        log.info(f"Started streaming TV game: {d.get('id')}")
-                        self.e_tv_stream_event.notify(EventTopics.GAME_START, data=d)
-
-                    if t == 'fen':
-                        self.e_tv_stream_event.notify(EventTopics.MOVE_MADE, data=d)
-
-            except Exception as e:
-                self.handle_exceptions(e)
-
-            else:
-                if not self._stopped.is_set():
-                    self.retries = 0
-                    log.debug("Sleeping 2 seconds before finding next TV game")
-                    sleep(2)
-
-    def handle_exceptions(self, e: Exception):
-        """Handles the passed in exception and responds appropriately"""
-        log.error(e)
-        if self.retries <= self.max_retries:
-            delay = 2 * (self.retries + 1)
-
-            if isinstance(e, ResponseError):
-                if e.status_code == 429:
-                    delay = 60
-
-            log.info(f"Sleeping {delay} seconds before retrying ({self.max_retries - self.retries} retries left).")
-            self.e_tv_stream_event.notify(EventTopics.ERROR, msg=f"Error streaming. Retrying in {delay} seconds.")
-            sleep(delay)
-            self.retries += 1
-        else:
-            self.e_tv_stream_event.notify(EventTopics.ERROR, msg="Retries exhausted. Stopping TV.")
-            self.stop_watching()
+    def _on_cancel(self) -> None:
+        self.e_tv_stream_event.remove_all_listeners()
 
     def stop_watching(self):
+        """Cancels the stream immediately (no sleeps, bounded thread join)"""
         log.info("Stopping TV stream")
-        self._stopped.set()
-        self.e_tv_stream_event.remove_all_listeners()
+        self.cancel()

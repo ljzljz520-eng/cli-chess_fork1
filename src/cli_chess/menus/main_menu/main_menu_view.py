@@ -18,6 +18,22 @@ package_metadata = metadata("cli-chess")
 github_page = package_metadata["Home-page"]
 
 
+def _online_games_unavailable_text() -> str:
+    """Text shown in place of the online menu when the API is not ready.
+       Surfaces the actionable connection status (auth failure / retries
+       exhausted) when a token is linked but the stream is down.
+    """
+    from cli_chess.core.api.api_manager import api_status_message
+    if api_status_message:
+        return (f"{api_status_message}\n\n"
+                "Return to this menu once the connection is restored, "
+                "or re-link your Lichess API token in 'Settings'.")
+    return ("Missing API Token or API client unavailable.\n"
+            "Go to 'Settings' to link your Lichess API token.\n\n"
+            "For further assistance check out the Github page:\n"
+            f"{github_page}")
+
+
 class MainMenuView(MenuView):
     def __init__(self, presenter: MainMenuPresenter):
         self.presenter = presenter
@@ -36,10 +52,7 @@ class MainMenuView(MenuView):
                 ),
                 ConditionalContainer(
                     TextArea(
-                        "Missing API Token or API client unavailable.\n"
-                        "Go to 'Settings' to link your Lichess API token.\n\n"
-                        "For further assistance check out the Github page:\n"
-                        f"{github_page}",
+                        _online_games_unavailable_text,
                         wrap_lines=True, read_only=True, focusable=False
                     ),
                     filter=~is_done

@@ -2,12 +2,17 @@ from cli_chess.core.game import PlayableGameModelBase
 from cli_chess.core.game.game_options import GameOption
 from cli_chess.core.api import GameStateDispatcher
 from cli_chess.core.api.incoming_event_manger import IEMEventTopics
+from cli_chess.core.api.stream_manager import ConnectionState, PERMANENT_FAILURE_STATES
+from cli_chess.core.api.stream_manager import StreamUnavailableError, open_stream_response
 from cli_chess.utils import log, threaded, RequestSuccessfullySent, EventTopics
 from chess import COLORS, COLOR_NAMES, WHITE, BLACK, Color
 from berserk.formats import TEXT
 from enum import Enum, auto
 from typing import Optional, Dict
 from cli_chess.modules.chat import ChatModel
+
+RECOVERY_DEFAULT_MESSAGE = ("Connection to Lichess lost. Reconnecting and resynchronizing... "
+                            "Moves, chat, draw offers and resign are paused until the game is live again.")
 
 
 class EventSender(Enum):
@@ -30,6 +35,12 @@ class OnlineGameModel(PlayableGameModelBase):
         self.sent_challenge_id = None
         self._update_game_metadata(EventTopics.GAME_PARAMS, sender=EventSender.LOCAL, data=game_parameters)
         self.game_state_dispatcher = Optional[GameStateDispatcher]
+
+        # Connection/resync contract with the game state stream
+        self._gsd_live = False                # True only once an authoritative snapshot is applied
+        self._gsd_synced_once = False         # False until the first gameFull of this game
+        self._game_over_reported = False      # Guards duplicate game over/PGN side effects
+        self._seek_response = None            # Active seek response (closed to unblock on exit)
 
         self.chat_model = ChatModel()
 
@@ -78,9 +89,27 @@ class OnlineGameModel(PlayableGameModelBase):
                     "color": "random",  # lila PR# 15969
                     "ratingRange": "",
                 }
-                for _ in self.api_client.board._r.post("/api/board/seek", data=payload, fmt=TEXT, stream=True):
-                    if not self.searching:
-                        break
+                # The seek hangs until an opponent is found. Keep the response reference so
+                # exiting/cancelling while searching unblocks the read immediately.
+                response, stream = open_stream_response(
+                    method="POST",
+                    requestor=self.api_client.board._r,  # noqa
+                    path="/api/board/seek",
+                    fmt=TEXT,
+                    data=payload,
+                    timeout=(10, None),
+                )
+                self._seek_response = response
+                try:
+                    for _ in stream:
+                        if not self.searching:
+                            break
+                finally:
+                    self._seek_response = None
+                    try:
+                        response.close()
+                    except Exception as e:
+                        log.debug(f"Error closing seek response: {e}")
         except Exception as e:
             # Since this exception happened in a thread, notify via the model event instead of raising
             self.searching = False
@@ -97,9 +126,13 @@ class OnlineGameModel(PlayableGameModelBase):
             self.game_in_progress = True
             self.searching = False
             self.playing_game_id = game_id
+            self._gsd_live = False
+            self._gsd_synced_once = False
+            self._game_over_reported = False
 
             self.game_state_dispatcher = GameStateDispatcher(game_id)
             self.game_state_dispatcher.add_event_listener(self._handle_gsd_event)
+            self.game_state_dispatcher.e_stream_state_changed.add_listener(self._handle_gsd_connection_state)
             self.game_state_dispatcher.start()
 
     def _game_end(self) -> None:
@@ -107,7 +140,33 @@ class OnlineGameModel(PlayableGameModelBase):
         self.game_in_progress = False
         self.searching = False
         self.playing_game_id = None
-        self.api_iem.unsubscribe_from_events(self._handle_iem_event)
+        self._gsd_live = False
+        self._close_seek_response()
+        try:
+            self.api_iem.unsubscribe_from_events(self._handle_iem_event)
+        except Exception as e:
+            log.debug(f"Unable to unsubscribe from IEM events: {e}")
+
+    def _close_seek_response(self) -> None:
+        """Closes any in progress seek response so a blocked read unblocks immediately"""
+        seek_response = self._seek_response
+        self._seek_response = None
+        if seek_response is not None:
+            try:
+                seek_response.close()
+            except Exception as e:
+                log.debug(f"Error closing seek response: {e}")
+
+    def _reject_if_stream_not_live(self) -> None:
+        """Commands (move, chat, draw, resign, takeback) are only accepted against a
+           live, synchronized stream. During recovery they are explicitly rejected
+           so they cannot be lost or applied twice after reconnection.
+        """
+        if not self._gsd_live:
+            raise StreamUnavailableError(
+                "Not connected to Lichess. Waiting for live game synchronization... "
+                "command not sent."
+            )
 
     def make_move(self, move: str):
         """Sends the move to the board model for a validity check. If valid this
@@ -115,6 +174,7 @@ class OnlineGameModel(PlayableGameModelBase):
            Raises an exception on move or API errors.
         """
         if self.game_in_progress:
+            self._reject_if_stream_not_live()
             try:
                 move = move.strip()
                 if not move:
@@ -135,8 +195,12 @@ class OnlineGameModel(PlayableGameModelBase):
                 raise Warning("Game has already ended")
 
     def set_premove(self, move: str) -> None:
-        """Sets the premove. Raises an exception on an invalid premove"""
+        """Sets the premove. Raises an exception on an invalid premove.
+           Premoves are rejected during recovery so a stale move can never
+           be applied against a resynchronized position.
+        """
         if self.game_in_progress and move and not self.is_my_turn():
+            self._reject_if_stream_not_live()
             if move == "0000":
                 raise Warning("Null moves are not supported in online games")
             self.premove_model.set_premove(move)
@@ -144,6 +208,7 @@ class OnlineGameModel(PlayableGameModelBase):
     def propose_takeback(self) -> None:
         """Notifies the game state dispatcher to propose a takeback"""
         if self.game_in_progress:
+            self._reject_if_stream_not_live()
             try:
                 if len(self.board_model.get_move_stack()) < 2:
                     raise Warning("Cannot send takeback with less than two moves")
@@ -165,6 +230,7 @@ class OnlineGameModel(PlayableGameModelBase):
     def offer_draw(self) -> None:
         """Notifies the game state dispatcher to offer a draw"""
         if self.game_in_progress:
+            self._reject_if_stream_not_live()
             if self.vs_ai:
                 raise Warning("Lichess AI does not accept draw offers")
 
@@ -183,6 +249,7 @@ class OnlineGameModel(PlayableGameModelBase):
     def resign(self) -> None:
         """Notifies the game state dispatcher to resign the game"""
         if self.game_in_progress:
+            self._reject_if_stream_not_live()
             try:
                 self.game_state_dispatcher.resign()
             except Exception:
@@ -197,6 +264,7 @@ class OnlineGameModel(PlayableGameModelBase):
     def post_message(self, text: str):
         """Send message to opponent"""
         if self.game_in_progress:
+            self._reject_if_stream_not_live()
             try:
                 self.game_state_dispatcher.post_message(text)
             except Exception:
@@ -246,18 +314,47 @@ class OnlineGameModel(PlayableGameModelBase):
             log.error(f"Error handling IncomingEventManager event: {e}")
             raise
 
+    def _handle_gsd_connection_state(self, state: ConnectionState, *, message: str = "") -> None:
+        """Listens to the game state stream connection lifecycle. While the stream
+           is recovering, commands are gated and a status alert is shown; permanent
+           failures surface an actionable message instead of leaving the game live.
+        """
+        if state in (ConnectionState.RECOVERING, ConnectionState.RATE_LIMITED):
+            if self.game_in_progress and self._gsd_live:
+                self._gsd_live = False
+                self.premove_model.clear_premove()
+                self._notify_game_model_updated(EventTopics.ERROR, msg=message or RECOVERY_DEFAULT_MESSAGE)
+            elif self.game_in_progress:
+                # Initial connection attempts before the first snapshot
+                self._gsd_live = False
+
+        elif state in PERMANENT_FAILURE_STATES and self.game_in_progress:
+            self._gsd_live = False
+            self.premove_model.clear_premove()
+            self._notify_game_model_updated(EventTopics.ERROR, msg=message or RECOVERY_DEFAULT_MESSAGE)
+
     def _handle_gsd_event(self, *args, data: Optional[Dict] = None) -> None:
         """Handles received from the GameStateDispatcher. Incoming events are
-           specific to this game being played
+           specific to this game being played. ``gameFull`` is treated as the
+           authoritative snapshot both at game start and after any reconnect,
+           leaving move order, side to move, clocks and terminal state exactly
+           as the server reports them.
         """
         if not data:
             return
+        reconnecting = False
         try:
             if EventTopics.GAME_START in args:
+                # This runs at start and on every reconnect (resync). The board is
+                # reset to the initial FEN and the full move list is replayed, so a
+                # drop at any point in a half-move cannot duplicate or lose a ply.
+                reconnecting = self._gsd_synced_once and not self._gsd_live
                 self.board_model.reinitialize_board(variant=self.game_metadata.variant,
                                                     orientation=(self.my_color if self.board_model.get_variant_name() != "racingkings" else WHITE),
                                                     fen=data.get('initialFen', ""))
-                self.board_model.make_moves_from_list(data.get('state', {}).get('moves', []).split())
+                self.board_model.make_moves_from_list(data.get('state', {}).get('moves', '').split())
+                self._gsd_live = True
+                self._gsd_synced_once = True
 
             elif EventTopics.MOVE_MADE in args:
                 # TODO: Take some time measurements to see how much of an impact this approach is
@@ -286,6 +383,14 @@ class OnlineGameModel(PlayableGameModelBase):
                 self.chat_model.add_message(username, text)
 
             self._update_game_metadata(*args, sender=EventSender.FROM_GSD, data=data)
+
+            if reconnecting:
+                # Sent after the GAME_START snapshot notification (which clears any
+                # stale recovery alert) so the resync confirmation stays visible.
+                self._notify_game_model_updated(
+                    EventTopics.GAME_SEARCH,
+                    msg="Reconnected to Lichess. Board, clocks and game state synchronized."
+                )
         except Exception as e:
             log.error(f"Error handling GameStateDispatcher event: {e}")
             raise
@@ -364,32 +469,46 @@ class OnlineGameModel(PlayableGameModelBase):
 
     def _report_game_over(self, status: str, winner: str) -> None:
         """Saves game information and notifies listeners that the game has ended.
-           This should only ever be called if the game is confirmed to be over
+           This should only ever be called if the game is confirmed to be over.
+           Guarded so duplicate terminal events (e.g. IEM gameFinish plus the
+           GSD terminal snapshot) cannot produce duplicate game over/PGN output.
         """
+        if self._game_over_reported:
+            log.debug("Game over already reported; ignoring duplicate terminal event")
+            return
+
+        self._game_over_reported = True
         self._game_end()
         self.game_metadata.game_status.status = status  # status list can be found in lila status.ts
         self.game_metadata.game_status.winner = winner
         self.game_metadata.set_clock_ticking(None)
         self._notify_game_model_updated(EventTopics.GAME_END)
 
+    def _cancel_game_stream(self) -> None:
+        """Cancels the game state stream thread (bounded join, immediate read unblock)"""
+        gsd = self.game_state_dispatcher
+        if isinstance(gsd, GameStateDispatcher):
+            log.debug(f"Cancelling {type(gsd).__name__} (id={id(gsd)})")
+            gsd.cancel()
+
     def cleanup(self) -> None:
         """Cleans up after this model by clearing event listeners and subscriptions.
            This should only ever be run when the models are no longer needed. This is
            called automatically on exit.
         """
+        self._cancel_game_stream()
         super().cleanup()
 
         if self.api_iem:
-            self.api_iem.unsubscribe_from_events(self._handle_iem_event)
-            log.debug(f"Cleared subscription from {type(self.api_iem).__name__} (id={id(self.api_iem)})")
-
-        if self.game_in_progress:
-            self.game_state_dispatcher.unsubscribe_from_events(self._handle_gsd_event)
-            log.debug(f"Cleared subscription from {type(self.game_state_dispatcher).__name__} (id={id(self.game_state_dispatcher)})")
+            try:
+                self.api_iem.unsubscribe_from_events(self._handle_iem_event)
+                log.debug(f"Cleared subscription from {type(self.api_iem).__name__} (id={id(self.api_iem)})")
+            except Exception as e:
+                log.debug(f"Unable to clear IEM subscription: {e}")
 
     def exit(self):
         """Gracefully exit the online game model. Ensure subscriptions are
-           cleaned up and any active game searches are closed
+           cleaned up and any active game searches and streams are closed
         """
         if self.searching and self.sent_challenge_id:
             try:
@@ -399,3 +518,4 @@ class OnlineGameModel(PlayableGameModelBase):
             self.sent_challenge_id = None
 
         self._game_end()
+        self._cancel_game_stream()
